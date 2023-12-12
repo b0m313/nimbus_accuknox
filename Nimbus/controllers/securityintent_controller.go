@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"git.cclab-inu.com/b0m313/nimbus/operator/api/v1"
+	"github.com/5GSEC/nimbus/Nimbus/api/v1"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	general "github.com/5GSEC/nimbus/Nimbus/controllers/general"
