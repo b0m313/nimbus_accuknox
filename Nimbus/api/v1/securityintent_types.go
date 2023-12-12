@@ -28,59 +28,106 @@ type SecurityIntentSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
 
-	Selector Selector `json:"selector"` // Define criteria for selecting resources
-	Intent   Intent   `json:"intent"`   // Define the details of the security policy.
-}
-
-// Selector defines the selection criteria for resources
-type Selector struct {
-	Match Match    `json:"match,omitempty"` // Define the resource filter to be used
-	CEL   []string `json:"cel"`             // Define filter conditions as CEL expressions
-}
-
-// Match defines the resource filters to be used
-type Match struct {
-	Any []ResourceFilter `json:"any,omitempty"` // Apply when one or more conditions match
-	All []ResourceFilter `json:"all,omitempty"` //Apply when all conditions must match
-}
-
-// ResourceFilter is used for filtering resources, subjects, roles, and cluster roles
-type ResourceFilter struct {
-	Resources Resources `json:"resources,omitempty"` // Define properties to select k8s resources
-	Subjects  []Subject `json:"subjects,omitempty"`  // Define the subjects to filter
-	Roles     []string  `json:"roles,omitempty"`     // Define the roles to filter.
-}
-
-// Resources defines the properties for selecting Kubernetes resources
-type Resources struct {
-	Names      []string `json:"names,omitempty"`      // Define the resource name
-	Namespaces []string `json:"namespaces,omitempty"` // Define the namespaces to which the resource belongs
-	Kinds      []string `json:"kinds"`                // Define resource kinds
-	Operations []string `json:"operations,omitempty"` // Define operations for the resource
-
-	MatchLabels map[string]string `json:"matchLabels,omitempty"` // Define labels to apply to the resource
-}
-
-// Subject defines the subject for filtering
-type Subject struct {
-	Kind string `json:"kind"`           // Define the kind of policy
-	Name string `json:"name,omitempty"` // Define the name of the policy
+	Intent Intent `json:"intent"` // Define the details of the security policy.
 }
 
 // Intent defines the security policy details
 type Intent struct {
-	Action   string     `json:"action"`   // Define the action of the policy
-	Mode     string     `json:"mode"`     // Defines the mode of the policy
-	Type     string     `json:"type"`     // Defines the type of the policy
-	Resource []Resource `json:"resource"` // Define the resource to which the security policy applies
+	Description string     `json:"description"` // Define the description
+	Action      string     `json:"action"`      // Define the action of the policy
+	Type        string     `json:"type"`        // Defines the type of the policy
+	Resource    []Resource `json:"resource"`    // Define the resources to which the security policy applies
 }
 
 // Resource defines the resources that the security policy applies to
 type Resource struct {
-	Key    string   `json:"key,omitempty"`    // Define a resource key
-	Val    []string `json:"val,omitempty"`    // Define a resource value list
-	Valcel string   `json:"valcel,omitempty"` // Define a CEL expression
-	Attrs  []string `json:"attrs,omitempty"`  // Define additional attributes
+	Network      []Network      `json:"network,omitempty"`
+	Process      []Process      `json:"process,omitempty"`
+	File         []File         `json:"file,omitempty"`
+	Capabilities []Capabilities `json:"capabilities,omitempty"`
+	Syscalls     []Syscalls     `json:"syscalls,omitempty"`
+	FromCIDRSet  []CIDRSet      `json:"fromCIDRSet,omitempty"`
+	ToPorts      []ToPort       `json:"toPorts,omitempty"`
+}
+
+// Network defines the network-related policies
+type Network struct {
+	MatchProtocols []MatchProtocol `json:"matchProtocols,omitempty"`
+}
+
+// Process defines the process-related policies
+type Process struct {
+	MatchPaths       []MatchPath      `json:"matchPaths,omitempty"`
+	MatchDirectories []MatchDirectory `json:"matchDirectories,omitempty"`
+	MatchPatterns    []MatchPattern   `json:"matchPatterns,omitempty"`
+}
+
+// File defines the file-related policies
+type File struct {
+	MatchPaths       []MatchPath      `json:"matchPaths,omitempty"`
+	MatchDirectories []MatchDirectory `json:"matchDirectories,omitempty"`
+}
+
+// Capabilities defines the capabilities-related policies
+type Capabilities struct {
+	MatchCapabilities []MatchCapability `json:"matchCapabilities,omitempty"`
+}
+
+// Syscalls defines the syscalls-related policies
+type Syscalls struct {
+	MatchSyscalls []MatchSyscall `json:"matchSyscalls,omitempty"`
+}
+
+// CIDRSet defines CIDR ranges for network policies
+type CIDRSet struct {
+	CIDR string `json:"cidr,omitempty"`
+}
+
+// ToPort defines ports and protocols for network policies
+type ToPort struct {
+	Ports []Port `json:"ports,omitempty"`
+}
+
+// Port defines a network port and its protocol
+type Port struct {
+	Port     string `json:"port,omitempty"`
+	Protocol string `json:"protocol,omitempty"`
+}
+
+// MatchProtocol defines a protocol for network policies
+type MatchProtocol struct {
+	Protocol string `json:"protocol,omitempty"`
+}
+
+// MatchPath defines a path for process or file policies
+type MatchPath struct {
+	Path string `json:"path,omitempty"`
+}
+
+// MatchDirectory defines a directory for process or file policies
+type MatchDirectory struct {
+	Directory  string       `json:"dir,omitempty"`
+	FromSource []FromSource `json:"fromSource,omitempty"`
+}
+
+// MatchPattern defines a pattern for process policies
+type MatchPattern struct {
+	Pattern string `json:"pattern,omitempty"`
+}
+
+// MatchSyscall defines a syscall for syscall policies
+type MatchSyscall struct {
+	Syscalls []string `json:"syscalls,omitempty"`
+}
+
+// MatchCapability defines a capability for capabilities policies
+type MatchCapability struct {
+	Capability string `json:"capability,omitempty"`
+}
+
+// FromSource defines a source path for directory-based policies
+type FromSource struct {
+	Path string `json:"path,omitempty"`
 }
 
 // SecurityIntentStatus defines the observed state of SecurityIntent
