@@ -9,7 +9,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	intentv1 "github.com/5GSEC/nimbus/api/v1"
+	intentv1 "github.com/5GSEC/nimbus/Nimbus/api/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 )
 
@@ -33,32 +33,24 @@ func NewWatcherIntent(client client.Client) (*WatcherIntent, error) {
 
 // Reconcile is the method that handles the reconciliation of the Kubernetes resources.
 func (wi *WatcherIntent) Reconcile(ctx context.Context, req ctrl.Request) (*intentv1.SecurityIntent, error) {
-	log := log.FromContext(ctx) // Get the logger from the context.
+	log := log.FromContext(ctx)
 
-	// Check if WatcherIntent or its client is not initialized.
 	if wi == nil || wi.Client == nil {
-		fmt.Println("WatcherIntent is nil or Client is nil in Reconcile")
+		log.Info("WatcherIntent is nil or Client is nil in Reconcile")
 		return nil, fmt.Errorf("WatcherIntent or Client is not initialized")
 	}
 
-	intent := &intentv1.SecurityIntent{} // Create an instance of SecurityIntent.
-	// Attempt to get the SecurityIntent resource from Kubernetes.
-	err := wi.Client.Get(ctx, types.NamespacedName{
-		Name:      req.Name,
-		Namespace: req.Namespace,
-	}, intent)
+	intent := &intentv1.SecurityIntent{}
+	err := wi.Client.Get(ctx, types.NamespacedName{Name: req.Name, Namespace: req.Namespace}, intent)
 
-	if err != nil {
-		// Handle the case where the SecurityIntent resource is not found.
+	if err == nil {
+		return intent, nil
+	} else {
 		if errors.IsNotFound(err) {
-			log.Info("SecurityIntent resource not found. Ignoring since object must be deleted")
+			log.Info("SecurityIntent resource not found. Ignoring since object must be deleted", "Name", req.Name, "Namespace", req.Namespace)
 			return nil, nil
 		}
-		// Log and return an error if there is a problem getting the SecurityIntent.
-		log.Error(err, "Failed to get SecurityIntent")
+		log.Error(err, "Failed to get SecurityIntent", "Name", req.Name, "Namespace", req.Namespace)
 		return nil, err
 	}
-
-	// Return the SecurityIntent instance if found successfully.
-	return intent, nil
 }
