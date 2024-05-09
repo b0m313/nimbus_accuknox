@@ -23,7 +23,7 @@ type Intent struct {
 	Description string `json:"description,omitempty"`
 
 	// Action defines how the security policy will be enforced.
-	Action string `json:"action"`
+	Action string `json:"action,omitempty"`
 
 	// Severity defines the potential impact of a security violation related to the intent.
 	// Defaults to Low.

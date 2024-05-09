@@ -94,7 +94,6 @@ spec:
                       type: string
                     type: array
                 required:
-                - action
                 - id
                 type: object
             required:
