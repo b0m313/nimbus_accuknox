@@ -7,12 +7,14 @@ import (
 	"context"
 	"fmt"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/util/retry"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -23,6 +25,7 @@ import (
 	podwatcher "github.com/5GSEC/nimbus/pkg/adapter/nimbus-coco/watcher"
 	adapterutil "github.com/5GSEC/nimbus/pkg/adapter/util"
 	globalwatcher "github.com/5GSEC/nimbus/pkg/adapter/watcher"
+	"github.com/go-logr/logr"
 )
 
 var (
@@ -33,6 +36,7 @@ var (
 func init() {
 	utilruntime.Must(intentv1.AddToScheme(scheme))
 	utilruntime.Must(corev1.AddToScheme(scheme))
+	utilruntime.Must(appsv1.AddToScheme(scheme))
 	k8sClient = k8s.NewOrDie(scheme)
 }
 
@@ -58,217 +62,201 @@ func Run(ctx context.Context) {
 			close(podCh)
 			return
 		case np := <-npCh:
-			createOrUpdatePod(ctx, np.Name, np.Namespace, podCh)
+			reconcileDeploy(ctx, np.Name, np.Namespace, podCh)
 		case deletedNp := <-deletedNpCh:
-			deletePod(ctx, deletedNp.Name, deletedNp.Namespace)
-		case _ = <-clusterNpChan: // Fixme
+			deleteDeploy(ctx, deletedNp.Name, deletedNp.Namespace)
+		case _ = <-clusterNpChan:
 			fmt.Println("No-op for ClusterNimbusPolicy")
-		case _ = <-deletedClusterNpChan: // Fixme
+		case _ = <-deletedClusterNpChan:
 			fmt.Println("No-op for ClusterNimbusPolicy")
 		}
 	}
 }
 
-// NP에 따라 파드를 생성하거나 업데이트
-func createOrUpdatePod(ctx context.Context, npName, npNamespace string, podCh chan common.Request) {
+func reconcileDeploy(ctx context.Context, npName, npNamespace string, podCh chan common.Request) {
 	logger := log.FromContext(ctx)
 
-	np, err := getNP(ctx, npName, npNamespace)
+	np, err := getNP(ctx, logger, npName, npNamespace)
 	if err != nil {
-		logger.Error(err, "error geting NimbusPolicy")
+		logger.Error(err, "error getting NimbusPolicy")
 		return
 	}
 
 	if adapterutil.IsOrphan(np.GetOwnerReferences(), "SecurityIntentBinding") {
-		logger.V(4).Info("Ignoring orphan NimbusPolicy", "NimbusPolicy.Name", npName, "NimbusPolicy.Namespace", npNamespace)
+		logger.V(4).Info("ignoring orphan NimbusPolicy", "NimbusPolicy.Name", npName, "NimbusPolicy.Namespace", npNamespace)
 		return
 	}
 
-	pods, err := listPodsBySelector(ctx, np.Spec.Selector.MatchLabels)
+	deployments, err := listDeploy(ctx, np.Spec.Selector.MatchLabels)
 	if err != nil {
-		logger.Error(err, "error listing pods")
+		logger.Error(err, "error listing deployments")
 		return
 	}
 
-	if len(pods) == 0 {
-		logger.Info("Pod not found, wait for a matching pod to appear")
-		go waitForMatchingPods(ctx, podCh, np)
+	if len(deployments) == 0 {
+		logger.Info("Deployment not found, wait for a matching pod to appear")
+		go WaitForMatching(ctx, podCh, np)
 	} else {
-		for _, pod := range pods {
-			if shouldTransformToKata(&pod) {
-				createPodInKata(ctx, &pod, np)
-				deleteDanglingPod(ctx, &pod)
-			} else if isKataPod(&pod) {
-				logger.Info("Pod is already running on CVM pod", "Pod.Name", pod.Name)
+		for _, deployment := range deployments {
+			if isNonCVM(&deployment) {
+				updateDeployToCVM(ctx, logger, &deployment, np)
+			} else {
+				logger.Info("Deployment is already running on CVM", "Deployment.Name", deployment.Name)
+				updateDeployMetadata(ctx, logger, &deployment, np)
 			}
 		}
 	}
 }
 
-func waitForMatchingPods(ctx context.Context, podCh chan common.Request, np *intentv1.NimbusPolicy) {
+func WaitForMatching(ctx context.Context, podCh chan common.Request, np *intentv1.NimbusPolicy) {
 	logger := log.FromContext(ctx)
+	var stopLoop bool
 
 	for {
+		if stopLoop {
+			return
+		}
 		select {
 		case <-ctx.Done():
 			return
 		case podReq := <-podCh:
 			pod, err := getPod(ctx, podReq.Name, podReq.Namespace)
 			if err != nil {
-				logger.Error(err, "failed to fetch pod details", "Pod.Name", podReq.Name)
+				if errors.IsNotFound(err) {
+					logger.V(1).Info("Pod not found, it might have been deleted", "Pod.Name", podReq.Name, "Namespace", podReq.Namespace)
+				} else {
+					logger.Error(err, "failed to fetch pod details", "Pod.Name", podReq.Name)
+				}
 				continue
 			}
-			if matchesPolicyLabels(pod.Labels, np.Spec.Selector.MatchLabels) {
+			if checkLabelMatch(pod.Labels, np.Spec.Selector.MatchLabels) {
 				logger.Info("K8s Pod found", "Pod.Name", pod.Name, "Pod.Namespace", pod.Namespace)
-				if isKataPod(pod) {
-					logger.Info("Pod is already running on the desired CVM runtime", "Pod.Name", pod.Name)
-					return
-				} else if shouldTransformToKata(pod) {
-					logger.Info("Transforming K8s Pod to CVM Pod", "Pod.Name", pod.Name)
-					createPodInKata(ctx, pod, np)
-					deleteDanglingPod(ctx, pod)
+				deployment, err := getDeployFromPod(ctx, pod)
+				if err != nil {
+					if errors.IsNotFound(err) {
+						createDeployFromPod(ctx, logger, pod, np)
+						deletePod(ctx, logger, pod)
+						stopLoop = true
+					} else {
+						logger.Error(err, "failed to fetch deployment details", "Pod.Name", podReq.Name)
+					}
+					continue
+				}
+				if isNonCVM(deployment) {
+					updateDeployToCVM(ctx, logger, deployment, np)
+					stopLoop = true
+				} else {
+					logger.Info("Deployment is already running on CVM", "Deployment.Name", deployment.Name)
+					updateDeployMetadata(ctx, logger, deployment, np)
+					stopLoop = true
 				}
 			}
 		}
 	}
 }
 
-// 주어진 파드를 기반으로 kata container pod를 생성
-func createPodInKata(ctx context.Context, oldPod *corev1.Pod, np *intentv1.NimbusPolicy) {
-	logger := log.FromContext(ctx)
-	newPods := processor.BuildpodsFromKata(logger, np, oldPod)
+func createDeployFromPod(ctx context.Context, logger logr.Logger, pod *corev1.Pod, np *intentv1.NimbusPolicy) {
+	logger.Info("Create new Deployment for Pod", "Pod.Name", pod.Name, "Pod.Namespace", pod.Namespace)
 
-	for _, newPod := range newPods {
-		// Set NimbusPolicy as the owner of the pod
-		//if err := ctrl.SetControllerReference(np, &newPod, scheme); err != nil {
-		//	logger.Error(err, "failed to set OwnerReference on Pod", "Pod.Name", newPod.Name, "Pod.Namespace", newPod.Namespace)
-		//	return
-		//}
+	newDeployment := processor.BuildDeployFromPod(pod, np)
 
-		// Check if the pod already exists
-		var existingPod corev1.Pod
-		err := k8sClient.Get(ctx, types.NamespacedName{Name: newPod.Name, Namespace: newPod.Namespace}, &existingPod)
-		if err != nil && !errors.IsNotFound(err) {
-			logger.Error(err, "failed to check if CVM Pod already exists", "Pod.Name", newPod.Name)
-			return
-		}
-		if err == nil {
-			continue // Skip creation if pod already exists
-		}
-
-		// If not found, create the new pod
-		if err := k8sClient.Create(ctx, &newPod); err != nil {
-			logger.Error(err, "failed to create CVM Pod", "Pod.Name", newPod.Name)
-			continue
-		}
-		logger.Info("Successfully created CVM Pod", "Pod.Name", newPod.Name)
-	}
-}
-
-func createPodInK8s(ctx context.Context, oldPod corev1.Pod) *corev1.Pod {
-	logger := log.FromContext(ctx)
-
-	// 기존 파드 정보를 기반으로 새로운 일반 파드를 생성합니다.
-	newPod := processor.BuildpodsFromK8s(logger, oldPod)
-
-	// 새로운 일반 파드를 생성합니다.
-	if err := k8sClient.Create(ctx, &newPod); err != nil {
-		logger.Error(err, "Failed to create K8s Pod", "Pod.Name", newPod.Name)
-		return nil
-	}
-	logger.Info("Successfully created K8s Pod", "Pod.Name", newPod.Name)
-	return &newPod
-}
-
-func deletePod(ctx context.Context, npName, namespace string) {
-	logger := log.FromContext(ctx)
-
-	// NimbusPolicy에 연결된 CVM 파드들을 필터링하여 조회합니다.
-	labelSelector := labels.SelectorFromSet(map[string]string{"app.kubernetes.io/managed-by": "nimbus-coco"})
-	listOpts := client.ListOptions{Namespace: namespace, LabelSelector: labelSelector}
-	var pods corev1.PodList
-	if err := k8sClient.List(ctx, &pods, &listOpts); err != nil {
-		logger.Error(err, "Failed to list Pods for NimbusPolicy", "NimbusPolicy.Name", npName)
+	if err := ctrl.SetControllerReference(np, &newDeployment, scheme); err != nil {
+		logger.Error(err, "failed to set OwnerReference on new Deployment", "Deployment.Name", newDeployment.Name, "Deployment.Namespace", newDeployment.Namespace)
 		return
 	}
 
-	// 조회된 CVM 파드들을 일반 파드로 전환합니다.
-	for _, pod := range pods.Items {
-		if isKataPod(&pod) {
-			// CVM 파드를 일반 파드로 전환하기 위해 새로운 파드 생성
-			newPod := createPodInK8s(ctx, pod)
-			if newPod != nil {
-				// 새로운 파드 생성 후 기존 CVM 파드 삭제
-				if err := k8sClient.Delete(ctx, &pod); err != nil {
-					logger.Error(err, "Failed to delete CVM Pod", "Pod.Name", pod.Name)
-				} else {
-					logger.Info("Successfully deleted CVM Pod and created normal Pod", "Old Pod.Name", pod.Name, "New Pod.Name", newPod.Name)
-				}
-			}
+	if err := k8sClient.Create(ctx, &newDeployment); err != nil {
+		logger.Error(err, "failed to create new Deployment", "Deployment.Name", newDeployment.Name)
+		return
+	}
+	logger.Info("Successfully created new Deployment", "Deployment.Name", newDeployment.Name)
+}
+
+func updateDeployToCVM(ctx context.Context, logger logr.Logger, oldDeployment *appsv1.Deployment, np *intentv1.NimbusPolicy) {
+	newDeployments := processor.BuildDeployFromCVM(logger, np, oldDeployment)
+
+	for _, newDeployment := range newDeployments {
+		if err := ctrl.SetControllerReference(np, &newDeployment, scheme); err != nil {
+			logger.Error(err, "failed to set OwnerReference on Deployment", "Deployment.Name", newDeployment.Name, "Deployment.Namespace", newDeployment.Namespace)
+			return
+		}
+
+		if err := k8sClient.Update(ctx, &newDeployment); err != nil {
+			logger.Error(err, "failed to update CVM Deployment", "Deployment.Name", newDeployment.Name)
+		} else {
+			logger.Info("Successfully updated CVM Deployment", "Deployment.Name", newDeployment.Name)
 		}
 	}
 }
 
-func deleteDanglingPod(ctx context.Context, pod *corev1.Pod) {
-	logger := log.FromContext(ctx)
+func updateDeployMetadata(ctx context.Context, logger logr.Logger, deployment *appsv1.Deployment, np *intentv1.NimbusPolicy) {
+	retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		// Fetch the latest version of Deployment before attempting update
+		var latestDeployment appsv1.Deployment
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: deployment.Name, Namespace: deployment.Namespace}, &latestDeployment); err != nil {
+			return err
+		}
+
+		if err := ctrl.SetControllerReference(np, &latestDeployment, scheme); err != nil {
+			logger.Error(err, "failed to set OwnerReference on Deployment", "Deployment.Name", latestDeployment.Name, "Deployment.Namespace", latestDeployment.Namespace)
+			return err
+		}
+
+		processor.AddManagedByAnnotation(&latestDeployment)
+
+		if err := k8sClient.Update(ctx, &latestDeployment); err != nil {
+			return err
+		}
+
+		logger.Info("Successfully updated Deployment with Metadata", "Deployment.Name", latestDeployment.Name)
+		return nil
+	})
+
+	if retryErr != nil {
+		logger.Error(retryErr, "failed to update Deployment with Metadata after retries", "Deployment.Name", deployment.Name)
+	}
+}
+
+func deletePod(ctx context.Context, logger logr.Logger, pod *corev1.Pod) {
 	err := k8sClient.Delete(ctx, pod)
 	if err != nil {
-		logger.Error(err, "failed to delete K8s Pod")
+		logger.Error(err, "failed to delete Pod", "Pod.Name", pod.Name)
+	} else {
+		logger.Info("Successfully deleted Pod", "Pod.Name", pod.Name)
 	}
-	logger.Info("K8s Pod deleted successfully", "Pod.Name", pod.Name)
 }
 
-func shouldTransformToKata(pod *corev1.Pod) bool {
-	return pod.Spec.RuntimeClassName == nil || *pod.Spec.RuntimeClassName != "kata-qemu-snp"
-}
-
-func isKataPod(pod *corev1.Pod) bool {
-	return pod.Spec.RuntimeClassName != nil && *pod.Spec.RuntimeClassName == "kata-qemu-snp"
-}
-
-func matchesPolicyLabels(podLabels, policyLabels map[string]string) bool {
-	for k, v := range policyLabels {
-		if podLabels[k] != v {
-			return false
-		}
-	}
-	return true
-}
-
-// 주어진 셀렉터로 파드를 조회
-func listPodsBySelector(ctx context.Context, selector map[string]string) ([]corev1.Pod, error) {
-	var podList corev1.PodList
-	listOpts := &client.ListOptions{
-		LabelSelector: labels.SelectorFromSet(selector),
-	}
-	if err := k8sClient.List(ctx, &podList, listOpts); err != nil {
-		return nil, err
-	}
-	return podList.Items, nil
-}
-
-func getNP(ctx context.Context, npName, namespace string) (*intentv1.NimbusPolicy, error) {
+func deleteDeploy(ctx context.Context, npName, namespace string) {
 	logger := log.FromContext(ctx)
-	var np intentv1.NimbusPolicy
 
-	err := k8sClient.Get(ctx, types.NamespacedName{Name: npName, Namespace: namespace}, &np)
+	// NimbusPolicy가 실제로 삭제되기 전에 CVM 디플로이먼트 정보를 가져와서 캐시에 저장합니다.
+	np, err := getNP(ctx, logger, npName, namespace)
 	if err != nil {
 		if !errors.IsNotFound(err) {
 			logger.Error(err, "failed to get NimbusPolicy", "NimbusPolicy.Name", npName, "NimbusPolicy.Namespace", namespace)
 		}
-		return nil, err
+		return
 	}
 
-	return &np, nil
-}
-
-func getPod(ctx context.Context, podName, namespace string) (*corev1.Pod, error) {
-	logger := log.FromContext(ctx)
-	var pod corev1.Pod
-	err := k8sClient.Get(ctx, types.NamespacedName{Name: podName, Namespace: namespace}, &pod)
+	deployments, err := listDeploy(ctx, np.Spec.Selector.MatchLabels)
 	if err != nil {
-		logger.Error(err, "Error getting pod", "Pod.Name", podName, "Namespace", namespace)
-		return nil, err
+		logger.Error(err, "failed to list Deployments for NimbusPolicy", "NimbusPolicy.Name", npName)
+		return
 	}
-	return &pod, nil
+
+	for _, deployment := range deployments {
+		if isRunningOnCVM(&deployment) {
+			newDeployment := processor.BuildDeployFromK8s(logger, deployment)
+			if err := k8sClient.Create(ctx, &newDeployment); err != nil {
+				logger.Error(err, "failed to create normal Deployment from CVM Deployment", "Deployment.Name", deployment.Name)
+			} else {
+				logger.Info("Successfully created normal Deployment from CVM Deployment", "Old Deployment.Name", deployment.Name, "New Deployment.Name", newDeployment.Name)
+			}
+		}
+	}
+
+	// NimbusPolicy 삭제
+	if err := k8sClient.Delete(ctx, np); err != nil {
+		logger.Error(err, "failed to delete NimbusPolicy", "NimbusPolicy.Name", npName)
+	}
 }
