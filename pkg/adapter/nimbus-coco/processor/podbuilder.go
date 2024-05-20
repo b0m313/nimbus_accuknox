@@ -1,15 +1,6 @@
 package processor
 
-import (
-	"strings"
-
-	"github.com/go-logr/logr"
-	corev1 "k8s.io/api/core/v1"
-
-	v1 "github.com/5GSEC/nimbus/api/v1"
-	"github.com/5GSEC/nimbus/pkg/adapter/idpool"
-)
-
+/*
 func BuildpodsFromKata(logger logr.Logger, np *v1.NimbusPolicy, oldPod *corev1.Pod) []corev1.Pod {
 	// Build pods based on given IDs
 	var pods []corev1.Pod
@@ -17,7 +8,7 @@ func BuildpodsFromKata(logger logr.Logger, np *v1.NimbusPolicy, oldPod *corev1.P
 		id := nimbusRule.ID
 		if idpool.IsIdSupportedBy(id, "coco") {
 			pod := buildPodFor(id, oldPod)
-			pod.Name = strings.ToLower(id) + "-" + oldPod.Name
+			pod.Name = oldPod.Name
 			pod.Namespace = np.Namespace
 			pod.ObjectMeta.Labels = np.Spec.Selector.MatchLabels
 			addManagedByAnnotation(&pod)
@@ -69,8 +60,9 @@ func normalPod(pod corev1.Pod) corev1.Pod {
 			Volumes:          pod.Spec.Volumes,
 		},
 	}
-}
+}*/
 
+/*
 func removeIDPrefix(podName string) string {
 	index := strings.Index(podName, "-")
 	if index != -1 && index < len(podName)-1 {
@@ -78,7 +70,10 @@ func removeIDPrefix(podName string) string {
 	}
 	return podName
 }
+
+
 func addManagedByAnnotation(pod *corev1.Pod) {
 	pod.Annotations = make(map[string]string)
 	pod.Annotations["app.kubernetes.io/managed-by"] = "nimbus-coco"
 }
+*/
