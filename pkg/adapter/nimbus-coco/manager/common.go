@@ -16,17 +16,25 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-func isNonCVM(deployment *appsv1.Deployment) bool {
+func isNonCVMDeploy(deployment *appsv1.Deployment) bool {
 	return deployment.Spec.Template.Spec.RuntimeClassName == nil || *deployment.Spec.Template.Spec.RuntimeClassName != "kata-qemu-snp"
 }
 
-func isRunningOnCVM(deployment *appsv1.Deployment) bool {
+func isRunningOnCVMDeploy(deployment *appsv1.Deployment) bool {
 	return deployment.Spec.Template.Spec.RuntimeClassName != nil && *deployment.Spec.Template.Spec.RuntimeClassName == "kata-qemu-snp"
 }
 
-func checkLabelMatch(deploymentLabels, policyLabels map[string]string) bool {
+func isNonCVMPod(pod *corev1.Pod) bool {
+	return pod.Spec.RuntimeClassName == nil || *pod.Spec.RuntimeClassName != "kata-qemu-snp"
+}
+
+func isRunningOnCVMPod(pod *corev1.Pod) bool {
+	return pod.Spec.RuntimeClassName != nil && *pod.Spec.RuntimeClassName == "kata-qemu-snp"
+}
+
+func checkLabelMatch(Labels, policyLabels map[string]string) bool {
 	for k, v := range policyLabels {
-		if deploymentLabels[k] != v {
+		if Labels[k] != v {
 			return false
 		}
 	}
@@ -42,6 +50,17 @@ func listDeploy(ctx context.Context, selector map[string]string) ([]appsv1.Deplo
 		return nil, err
 	}
 	return deploymentList.Items, nil
+}
+
+func listPodsBySelector(ctx context.Context, selector map[string]string) ([]corev1.Pod, error) {
+	var podList corev1.PodList
+	listOpts := &client.ListOptions{
+		LabelSelector: labels.SelectorFromSet(selector),
+	}
+	if err := k8sClient.List(ctx, &podList, listOpts); err != nil {
+		return nil, err
+	}
+	return podList.Items, nil
 }
 
 func getNP(ctx context.Context, logger logr.Logger, npName, namespace string) (*intentv1.NimbusPolicy, error) {

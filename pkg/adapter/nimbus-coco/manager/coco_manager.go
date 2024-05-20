@@ -93,17 +93,55 @@ func reconcileDeploy(ctx context.Context, npName, npNamespace string, podCh chan
 		return
 	}
 
-	if len(deployments) == 0 {
-		logger.Info("Deployment not found, wait for a matching pod to appear")
+	pods, err := listPodsBySelector(ctx, np.Spec.Selector.MatchLabels)
+	if err != nil {
+		logger.Error(err, "error listing pods")
+		return
+	}
+
+	if len(pods) != 0 && len(deployments) == 0 {
+		reconcilePod(ctx, logger, np.Name, np.Namespace, podCh)
+	} else if len(deployments) == 0 {
+		logger.Info("Deployment not found, checking for matching pods")
 		go WaitForMatching(ctx, podCh, np)
 	} else {
 		for _, deployment := range deployments {
-			if isNonCVM(&deployment) {
+			if isNonCVMDeploy(&deployment) {
 				updateDeployToCVM(ctx, logger, &deployment, np)
 			} else {
 				logger.Info("Deployment is already running on CVM", "Deployment.Name", deployment.Name)
 				updateDeployMetadata(ctx, logger, &deployment, np)
 			}
+		}
+	}
+}
+
+// K8s Pod -> CVM Pod
+func reconcilePod(ctx context.Context, logger logr.Logger, npName, npNamespace string, podCh chan common.Request) {
+	np, err := getNP(ctx, logger, npName, npNamespace)
+	if err != nil {
+		logger.Error(err, "error getting NimbusPolicy")
+		return
+	}
+
+	if adapterutil.IsOrphan(np.GetOwnerReferences(), "SecurityIntentBinding") {
+		logger.V(4).Info("ignoring orphan NimbusPolicy", "NimbusPolicy.Name", npName, "NimbusPolicy.Namespace", npNamespace)
+		return
+	}
+
+	pods, err := listPodsBySelector(ctx, np.Spec.Selector.MatchLabels)
+	if err != nil {
+		logger.Error(err, "error listing pods")
+		return
+	}
+
+	for _, pod := range pods {
+		if isNonCVMPod(&pod) {
+			logger.Info("Found matching K8s Pod, converting to CVM Pod", "Pod.Name", pod.Name, "Pod.Namespace", pod.Namespace)
+			createPodInCVM(ctx, logger, &pod, np)
+			deleteDanglingPod(ctx, &pod)
+		} else if isRunningOnCVMPod(&pod) {
+			logger.Info("Pod is already running on CVM pod", "Pod.Name", pod.Name)
 		}
 	}
 }
@@ -130,19 +168,17 @@ func WaitForMatching(ctx context.Context, podCh chan common.Request, np *intentv
 				continue
 			}
 			if checkLabelMatch(pod.Labels, np.Spec.Selector.MatchLabels) {
-				logger.Info("K8s Pod found", "Pod.Name", pod.Name, "Pod.Namespace", pod.Namespace)
 				deployment, err := getDeployFromPod(ctx, pod)
 				if err != nil {
 					if errors.IsNotFound(err) {
-						createDeployFromPod(ctx, logger, pod, np)
-						deletePod(ctx, logger, pod)
+						reconcilePod(ctx, logger, np.Name, np.Namespace, podCh)
 						stopLoop = true
 					} else {
 						logger.Error(err, "failed to fetch deployment details", "Pod.Name", podReq.Name)
 					}
 					continue
 				}
-				if isNonCVM(deployment) {
+				if isNonCVMDeploy(deployment) {
 					updateDeployToCVM(ctx, logger, deployment, np)
 					stopLoop = true
 				} else {
@@ -155,21 +191,34 @@ func WaitForMatching(ctx context.Context, podCh chan common.Request, np *intentv
 	}
 }
 
-func createDeployFromPod(ctx context.Context, logger logr.Logger, pod *corev1.Pod, np *intentv1.NimbusPolicy) {
-	logger.Info("Create new Deployment for Pod", "Pod.Name", pod.Name, "Pod.Namespace", pod.Namespace)
+func createPodInCVM(ctx context.Context, logger logr.Logger, oldPod *corev1.Pod, np *intentv1.NimbusPolicy) {
+	newPods := processor.BuildpodsFromCoco(logger, np, oldPod)
 
-	newDeployment := processor.BuildDeployFromPod(pod, np)
+	for _, newPod := range newPods {
+		// Set NimbusPolicy as the owner of the pod
+		if err := ctrl.SetControllerReference(np, &newPod, scheme); err != nil {
+			logger.Error(err, "failed to set OwnerReference on Pod", "Pod.Name", newPod.Name, "Pod.Namespace", newPod.Namespace)
+			return
+		}
 
-	if err := ctrl.SetControllerReference(np, &newDeployment, scheme); err != nil {
-		logger.Error(err, "failed to set OwnerReference on new Deployment", "Deployment.Name", newDeployment.Name, "Deployment.Namespace", newDeployment.Namespace)
-		return
+		// Check if the pod already exists
+		var existingPod corev1.Pod
+		err := k8sClient.Get(ctx, types.NamespacedName{Name: newPod.Name, Namespace: newPod.Namespace}, &existingPod)
+		if err != nil && !errors.IsNotFound(err) {
+			logger.Error(err, "failed to check if CVM Pod already exists", "Pod.Name", newPod.Name)
+			return
+		}
+		if err == nil {
+			continue // Skip creation if pod already exists
+		}
+
+		// If not found, create the new pod
+		if err := k8sClient.Create(ctx, &newPod); err != nil {
+			logger.Error(err, "failed to create CVM Pod", "Pod.Name", newPod.Name)
+			continue
+		}
+		logger.Info("Successfully created CVM Pod", "Pod.Name", newPod.Name)
 	}
-
-	if err := k8sClient.Create(ctx, &newDeployment); err != nil {
-		logger.Error(err, "failed to create new Deployment", "Deployment.Name", newDeployment.Name)
-		return
-	}
-	logger.Info("Successfully created new Deployment", "Deployment.Name", newDeployment.Name)
 }
 
 func updateDeployToCVM(ctx context.Context, logger logr.Logger, oldDeployment *appsv1.Deployment, np *intentv1.NimbusPolicy) {
@@ -217,19 +266,18 @@ func updateDeployMetadata(ctx context.Context, logger logr.Logger, deployment *a
 	}
 }
 
-func deletePod(ctx context.Context, logger logr.Logger, pod *corev1.Pod) {
+func deleteDanglingPod(ctx context.Context, pod *corev1.Pod) {
+	logger := log.FromContext(ctx)
 	err := k8sClient.Delete(ctx, pod)
 	if err != nil {
-		logger.Error(err, "failed to delete Pod", "Pod.Name", pod.Name)
-	} else {
-		logger.Info("Successfully deleted Pod", "Pod.Name", pod.Name)
+		logger.Error(err, "failed to delete K8s Pod")
 	}
+	logger.Info("K8s Pod deleted successfully", "Pod.Name", pod.Name)
 }
 
 func deleteDeploy(ctx context.Context, npName, namespace string) {
 	logger := log.FromContext(ctx)
 
-	// NimbusPolicy가 실제로 삭제되기 전에 CVM 디플로이먼트 정보를 가져와서 캐시에 저장합니다.
 	np, err := getNP(ctx, logger, npName, namespace)
 	if err != nil {
 		if !errors.IsNotFound(err) {
@@ -245,7 +293,7 @@ func deleteDeploy(ctx context.Context, npName, namespace string) {
 	}
 
 	for _, deployment := range deployments {
-		if isRunningOnCVM(&deployment) {
+		if isRunningOnCVMDeploy(&deployment) {
 			newDeployment := processor.BuildDeployFromK8s(logger, deployment)
 			if err := k8sClient.Create(ctx, &newDeployment); err != nil {
 				logger.Error(err, "failed to create normal Deployment from CVM Deployment", "Deployment.Name", deployment.Name)
@@ -255,7 +303,6 @@ func deleteDeploy(ctx context.Context, npName, namespace string) {
 		}
 	}
 
-	// NimbusPolicy 삭제
 	if err := k8sClient.Delete(ctx, np); err != nil {
 		logger.Error(err, "failed to delete NimbusPolicy", "NimbusPolicy.Name", npName)
 	}
