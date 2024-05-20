@@ -57,6 +57,15 @@ func WatchPods(ctx context.Context, updatedPodCh chan common.Request) {
 			}
 			updatedPodCh <- podReq // Send updated pod information to the channel
 		},
+		/*
+			DeleteFunc: func(obj interface{}) {
+				u := obj.(*unstructured.Unstructured)
+				podReq := common.Request{
+					Name:      u.GetName(),
+					Namespace: u.GetNamespace(),
+				}
+				deletedPodCh <- podReq // Send pod deletion information to the channel
+			},*/
 	}
 	_, err := informer.AddEventHandler(handlers)
 	if err != nil {

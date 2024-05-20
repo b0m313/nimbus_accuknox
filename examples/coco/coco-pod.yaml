@@ -1,9 +1,9 @@
 apiVersion: v1
 kind: Pod
 metadata:
- name: nginx-kata-test
+ name: nginx-only
  labels:
-    app: nginx
+    app: nginx-test
 spec:
   runtimeClassName: kata-qemu-snp
   containers:
